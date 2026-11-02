@@ -1,0 +1,204 @@
+{
+  "best_model_name": "GRU",
+  "selection_reason": "GRU achieved lower Validation MAE (0.2141 kW) compared to LSTM (0.2424 kW).",
+  "validation_thresholds": {
+    "90.0": 0.6738,
+    "95.0": 0.8319,
+    "99.0": 1.0259
+  },
+  "metrics": {
+    "LSTM": {
+      "model_name": "LSTM",
+      "val_mae": 0.2424,
+      "val_rmse": 0.3385,
+      "test_mae": 0.2419,
+      "test_rmse": 0.3393,
+      "test_r2": 0.7656,
+      "training_duration_seconds": 3.41,
+      "inference_latency_ms": 0.509,
+      "epochs_trained": 8,
+      "loss_history": [
+        {
+          "epoch": 1,
+          "train_loss": 0.05040905252099037,
+          "val_loss": 0.03874162957072258,
+          "train_mae": 0.17178581655025482,
+          "val_mae": 0.16063404083251953
+        },
+        {
+          "epoch": 2,
+          "train_loss": 0.03603622689843178,
+          "val_loss": 0.03442775830626488,
+          "train_mae": 0.1568455845117569,
+          "val_mae": 0.15548314154148102
+        },
+        {
+          "epoch": 3,
+          "train_loss": 0.031463973224163055,
+          "val_loss": 0.028430255129933357,
+          "train_mae": 0.14740367233753204,
+          "val_mae": 0.1432507336139679
+        },
+        {
+          "epoch": 4,
+          "train_loss": 0.024603426456451416,
+          "val_loss": 0.020095298066735268,
+          "train_mae": 0.12892596423625946,
+          "val_mae": 0.11848320811986923
+        },
+        {
+          "epoch": 5,
+          "train_loss": 0.01786903105676174,
+          "val_loss": 0.013919860124588013,
+          "train_mae": 0.10099901258945465,
+          "val_mae": 0.08605100959539413
+        },
+        {
+          "epoch": 6,
+          "train_loss": 0.013728565536439419,
+          "val_loss": 0.011183236725628376,
+          "train_mae": 0.08482585847377777,
+          "val_mae": 0.07763613760471344
+        },
+        {
+          "epoch": 7,
+          "train_loss": 0.011330914683640003,
+          "val_loss": 0.00961332581937313,
+          "train_mae": 0.07602296024560928,
+          "val_mae": 0.07040712237358093
+        },
+        {
+          "epoch": 8,
+          "train_loss": 0.010453988797962666,
+          "val_loss": 0.008775157853960991,
+          "train_mae": 0.07198914885520935,
+          "val_mae": 0.0670834481716156
+        }
+      ],
+      "architecture": {
+        "name": "PowerPulse_LSTM",
+        "layers": [
+          {
+            "name": "lstm_layer",
+            "type": "LSTM",
+            "output_shape": "None"
+          },
+          {
+            "name": "dense_relu",
+            "type": "Dense",
+            "output_shape": "None"
+          },
+          {
+            "name": "output_prediction",
+            "type": "Dense",
+            "output_shape": "None"
+          }
+        ],
+        "total_parameters": 4897,
+        "optimizer": "Adam (lr=0.001)",
+        "loss": "MSE",
+        "input_shape": [
+          24,
+          1
+        ]
+      }
+    },
+    "GRU": {
+      "model_name": "GRU",
+      "val_mae": 0.2141,
+      "val_rmse": 0.3114,
+      "test_mae": 0.2135,
+      "test_rmse": 0.3172,
+      "test_r2": 0.7951,
+      "training_duration_seconds": 3.76,
+      "inference_latency_ms": 0.355,
+      "epochs_trained": 8,
+      "loss_history": [
+        {
+          "epoch": 1,
+          "train_loss": 0.032589852809906006,
+          "val_loss": 0.026106420904397964,
+          "train_mae": 0.14183378219604492,
+          "val_mae": 0.12894172966480255
+        },
+        {
+          "epoch": 2,
+          "train_loss": 0.021114420145750046,
+          "val_loss": 0.015621074475347996,
+          "train_mae": 0.1153603121638298,
+          "val_mae": 0.09429599344730377
+        },
+        {
+          "epoch": 3,
+          "train_loss": 0.013641671277582645,
+          "val_loss": 0.0117716733366251,
+          "train_mae": 0.08914676308631897,
+          "val_mae": 0.08283521980047226
+        },
+        {
+          "epoch": 4,
+          "train_loss": 0.01166952308267355,
+          "val_loss": 0.010371889919042587,
+          "train_mae": 0.08009682595729828,
+          "val_mae": 0.07527871429920197
+        },
+        {
+          "epoch": 5,
+          "train_loss": 0.010530502535402775,
+          "val_loss": 0.009325481951236725,
+          "train_mae": 0.07324182987213135,
+          "val_mae": 0.06956104189157486
+        },
+        {
+          "epoch": 6,
+          "train_loss": 0.00964285433292389,
+          "val_loss": 0.008508143946528435,
+          "train_mae": 0.06836650520563126,
+          "val_mae": 0.06593447178602219
+        },
+        {
+          "epoch": 7,
+          "train_loss": 0.00899728387594223,
+          "val_loss": 0.007879904471337795,
+          "train_mae": 0.064812071621418,
+          "val_mae": 0.062273744493722916
+        },
+        {
+          "epoch": 8,
+          "train_loss": 0.008565005846321583,
+          "val_loss": 0.007424391806125641,
+          "train_mae": 0.062338173389434814,
+          "val_mae": 0.059246353805065155
+        }
+      ],
+      "architecture": {
+        "name": "PowerPulse_GRU",
+        "layers": [
+          {
+            "name": "gru_layer",
+            "type": "GRU",
+            "output_shape": "None"
+          },
+          {
+            "name": "dense_relu",
+            "type": "Dense",
+            "output_shape": "None"
+          },
+          {
+            "name": "output_prediction",
+            "type": "Dense",
+            "output_shape": "None"
+          }
+        ],
+        "total_parameters": 3905,
+        "optimizer": "Adam (lr=0.001)",
+        "loss": "MSE",
+        "input_shape": [
+          24,
+          1
+        ]
+      }
+    }
+  },
+  "saved_at": "2026-10-29T12:23:38.807445"
+}
