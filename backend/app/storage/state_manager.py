@@ -2,17 +2,21 @@ import os
 import json
 import threading
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import pandas as pd
 import numpy as np
 import joblib
 
 from app.core.config import (
-    ARTIFACTS_DIR, MODELS_DIR, SCALERS_DIR, SAMPLE_DATA_PATH, PROCESSED_DATA_PATH
+    ARTIFACTS_DIR, MODELS_DIR, SCALERS_DIR, SAMPLE_DATA_PATH, PROCESSED_DATA_PATH,
+    DATA_DIR, SEQUENCE_LENGTH, TRAIN_SPLIT, VAL_SPLIT, TEST_SPLIT
 )
 from app.ml.preprocessing import (
     parse_uci_or_standard_csv, resample_to_hourly_mean, prepare_dataset_splits
 )
+from app.ml.models import train_single_model, evaluate_model_on_splits
+from app.ml.anomaly import compute_validation_thresholds, detect_anomalies_from_residuals
+
 
 class StateManager:
     _instance = None
@@ -27,168 +31,518 @@ class StateManager:
 
     def _init_state(self):
         self.state_lock = threading.Lock()
-        
-        # Dataset state
-        self.is_dataset_loaded = False
-        self.source_type = "none"
-        self.dataset_filename = None
-        self.hourly_df: Optional[pd.DataFrame] = None
+
+        # Raw Dataset Info
+        self.raw_file_path: Optional[str] = None
+        self.raw_filename: Optional[str] = None
         self.raw_metadata: Dict[str, Any] = {}
-        self.resample_stats: Dict[str, Any] = {}
+        self.is_dataset_loaded: bool = False
+
+        # Preprocessed Data
+        self.is_preprocessed: bool = False
+        self.hourly_df: Optional[pd.DataFrame] = None
+        self.preprocessing_summary: Dict[str, Any] = {}
         self.splits: Optional[Dict[str, np.ndarray]] = None
         self.scaler = None
         self.split_info: Dict[str, Any] = {}
+        self.active_target_col: str = "Global_active_power"
 
-        # Model state
-        self.models_trained = False
-        self.keras_models = {}
-        self.metrics = {}
+        # Models & Results
+        self.is_trained: bool = False
+        self.keras_models: Dict[str, Any] = {}
+        self.metrics: Dict[str, Any] = {}
+        self.current_model_name: Optional[str] = None
+        self.comparison_table: List[Dict[str, Any]] = []
         self.best_model_name: Optional[str] = None
-        self.selection_reason: str = "Awaiting training completion"
+        self.best_model_reason: Optional[str] = None
+
+        # Predictions & Anomalies
+        self.predictions: List[Dict[str, Any]] = []
+        self.anomalies: List[Dict[str, Any]] = []
+        self.anomaly_threshold_kw: float = 0.0
         self.validation_thresholds: Dict[float, float] = {}
 
-        # Training task tracking
-        self.train_status = {
-            "status": "idle",
-            "progress_percentage": 0.0,
-            "current_model": None,
-            "current_epoch": None,
-            "total_epochs": None,
-            "error_message": None,
-            "started_at": None,
-            "completed_at": None
-        }
-
-        # Anomaly reviews storage
-        self.reviews_file = os.path.join(ARTIFACTS_DIR, "anomaly_reviews.json")
-        self.anomaly_reviews = self._load_reviews()
-
-        # Check for previously saved state
-        self._try_restore_saved_state()
-
-    def _load_reviews(self) -> Dict[str, bool]:
-        if os.path.exists(self.reviews_file):
-            try:
-                with open(self.reviews_file, 'r') as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        return {}
-
-    def save_review(self, anomaly_id: str, reviewed: bool):
+    def save_raw_upload(self, file_path: str, filename: str) -> Dict[str, Any]:
+        """
+        Inspects raw uploaded CSV, extracts column types, preview of first 10 rows,
+        and auto-detects target and datetime columns.
+        """
         with self.state_lock:
-            self.anomaly_reviews[anomaly_id] = reviewed
-            try:
-                os.makedirs(ARTIFACTS_DIR, exist_ok=True)
-                with open(self.reviews_file, 'w') as f:
-                    json.dump(self.anomaly_reviews, f, indent=2)
-            except Exception as e:
-                print(f"Error saving review: {e}")
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"File not found: {file_path}")
 
-    def load_dataset_from_file(
+            # Detect delimiter
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                first_line = f.readline()
+                sep = ';' if ';' in first_line else ','
+
+            df_raw = pd.read_csv(
+                file_path,
+                sep=sep,
+                na_values=['?', 'NA', 'null', 'None', ''],
+                nrows=1000,
+                low_memory=False
+            )
+
+            if len(df_raw) == 0:
+                raise ValueError("Uploaded CSV file is empty.")
+
+            # Full row count
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                total_rows = sum(1 for _ in f) - 1
+
+            file_size_kb = round(os.path.getsize(file_path) / 1024, 2)
+            columns = [str(c) for c in df_raw.columns]
+
+            # Detect numeric columns
+            numeric_cols = []
+            for col in columns:
+                series = pd.to_numeric(df_raw[col], errors='coerce')
+                if series.notna().sum() > len(df_raw) * 0.4:
+                    numeric_cols.append(col)
+
+            # Auto-detect target column
+            detected_target = None
+            if 'Global_active_power' in columns:
+                detected_target = 'Global_active_power'
+            elif 'consumption' in [c.lower() for c in columns]:
+                detected_target = [c for c in columns if c.lower() == 'consumption'][0]
+            elif 'power' in [c.lower() for c in columns]:
+                detected_target = [c for c in columns if c.lower() == 'power'][0]
+            elif numeric_cols:
+                detected_target = numeric_cols[0]
+
+            # Auto-detect datetime column
+            detected_dt = None
+            if 'Date' in columns and 'Time' in columns:
+                detected_dt = 'Date & Time'
+            elif 'timestamp' in [c.lower() for c in columns]:
+                detected_dt = [c for c in columns if c.lower() == 'timestamp'][0]
+            elif 'datetime' in [c.lower() for c in columns]:
+                detected_dt = [c for c in columns if c.lower() == 'datetime'][0]
+
+            # Preview first 10 rows
+            preview_rows = df_raw.head(10).replace({np.nan: None}).to_dict(orient="records")
+
+            self.raw_file_path = file_path
+            self.raw_filename = filename
+            self.raw_metadata = {
+                "filename": filename,
+                "file_size_kb": file_size_kb,
+                "total_rows": max(total_rows, len(df_raw)),
+                "total_columns": len(columns),
+                "columns": columns,
+                "numeric_columns": numeric_cols,
+                "preview": preview_rows,
+                "detected_target_col": detected_target,
+                "detected_datetime_col": detected_dt,
+                "delimiter": sep,
+                "is_valid": True,
+                "message": f"Successfully validated '{filename}' ({total_rows} rows, {len(columns)} columns)."
+            }
+
+            self.is_dataset_loaded = True
+            # Reset downstream states
+            self.is_preprocessed = False
+            self.is_trained = False
+            self.predictions = []
+            self.anomalies = []
+            self.comparison_table = []
+
+            return self.raw_metadata
+
+    def preprocess_dataset(
         self,
-        file_path: str,
-        source_type: str = "uploaded",
-        timestamp_col: Optional[str] = None,
-        consumption_col: Optional[str] = None
+        target_col: Optional[str] = None,
+        timestamp_col: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Loads CSV, runs cleaning & hourly resampling, splits data and fits scaler.
-        Invalidates any previously trained models from older datasets.
+        Cleans data, handles missing values, resamples to hourly mean,
+        performs strict chronological 70/15/15 split, fits MinMaxScaler on train ONLY.
         """
         with self.state_lock:
+            if not self.raw_file_path or not os.path.exists(self.raw_file_path):
+                raise ValueError("No dataset uploaded yet. Please upload a CSV first.")
+
+            # Determine target column
+            chosen_target = target_col or self.raw_metadata.get("detected_target_col") or "Global_active_power"
+            self.active_target_col = chosen_target
+
+            # 1. Parse and clean
             cleaned_df, raw_meta = parse_uci_or_standard_csv(
-                file_path, timestamp_col, consumption_col
+                file_path=self.raw_file_path,
+                timestamp_col=timestamp_col,
+                consumption_col=chosen_target
             )
+
+            # 2. Resample to 1-hour intervals (mean)
             hourly_df, resample_stats = resample_to_hourly_mean(cleaned_df)
-            
+
             # Save processed hourly CSV
             os.makedirs(os.path.dirname(PROCESSED_DATA_PATH), exist_ok=True)
             hourly_df.to_csv(PROCESSED_DATA_PATH, index=False)
 
-            # Prepare chronological splits and fit scaler
+            # 3. Chronological splits (70% Train, 15% Val, 15% Test) with Scaler fitted on Train ONLY
             splits, scaler, split_info = prepare_dataset_splits(hourly_df)
 
             self.hourly_df = hourly_df
-            self.raw_metadata = raw_meta
-            self.resample_stats = resample_stats
             self.splits = splits
             self.scaler = scaler
             self.split_info = split_info
-            self.is_dataset_loaded = True
-            self.source_type = source_type
-            self.dataset_filename = os.path.basename(file_path)
 
-            # Invalidate previous models since dataset changed
-            self.models_trained = False
-            self.keras_models = {}
-            self.metrics = {}
-            self.best_model_name = None
-            self.selection_reason = "Dataset changed. Please retrain models."
-            self.validation_thresholds = {}
+            summary = {
+                "status": "success",
+                "message": "Dataset successfully cleaned, resampled to 1-hour intervals, and split chronologically.",
+                "target_column": chosen_target,
+                "initial_raw_rows": raw_meta.get("initial_rows", len(cleaned_df)),
+                "valid_raw_rows": raw_meta.get("valid_rows_after_cleaning", len(cleaned_df)),
+                "hourly_records": len(hourly_df),
+                "train_samples": split_info["train_samples"],
+                "val_samples": split_info["val_samples"],
+                "test_samples": split_info["test_samples"],
+                "input_sequence_length": SEQUENCE_LENGTH,
+                "date_range": {
+                    "start": resample_stats.get("start_timestamp", ""),
+                    "end": resample_stats.get("end_timestamp", "")
+                },
+                "mean_kw": round(resample_stats.get("mean_kw", 0.0), 3),
+                "min_kw": round(resample_stats.get("min_kw", 0.0), 3),
+                "max_kw": round(resample_stats.get("max_kw", 0.0), 3),
+                "scaler_train_min": round(split_info.get("scaler_data_min", 0.0), 4),
+                "scaler_train_max": round(split_info.get("scaler_data_max", 0.0), 4),
+                "missing_values_handled": raw_meta.get("missing_consumption_raw", 0) + resample_stats.get("interpolated_short_gaps", 0),
+                "split_ratio": "70% Train / 15% Validation / 15% Test"
+            }
+
+            self.preprocessing_summary = summary
+            self.is_preprocessed = True
+            self.is_trained = False
+            self.predictions = []
+            self.anomalies = []
+            self.comparison_table = []
+
+            return summary
+
+    def train_single_architecture(
+        self,
+        model_type: str,
+        epochs: int = 12,
+        batch_size: int = 64
+    ) -> Dict[str, Any]:
+        """
+        Trains real LSTM or GRU model with early stopping, computes genuine kW metrics,
+        derives 95th percentile validation positive residual threshold,
+        and detects anomalies on test set.
+        """
+        with self.state_lock:
+            if not self.is_preprocessed or self.splits is None:
+                # Auto-preprocess if dataset is loaded
+                if self.is_dataset_loaded and self.raw_file_path:
+                    self.preprocess_dataset()
+                else:
+                    raise ValueError("No dataset loaded or preprocessed.")
+
+            splits = self.splits
+            scaler = self.scaler
+
+            # Train model
+            model, training_info = train_single_model(
+                model_type=model_type.lower(),
+                X_train=splits["X_train"],
+                y_train=splits["y_train"],
+                X_val=splits["X_val"],
+                y_val=splits["y_val"],
+                epochs=epochs,
+                batch_size=batch_size,
+                patience=3
+            )
+
+            # Evaluate in genuine kW units
+            eval_metrics = evaluate_model_on_splits(
+                model=model,
+                model_name=model_type.upper(),
+                scaler=scaler,
+                splits=splits,
+                training_info=training_info
+            )
+
+            # Derive anomaly threshold from positive validation residuals (95th percentile)
+            thresholds = compute_validation_thresholds(eval_metrics["val_residuals"])
+            thresh_95 = thresholds.get(95.0, 0.5)
+
+            # Detect anomalies on Test set
+            test_timestamps = [str(ts) for ts in splits["ts_test"]]
+            test_actuals = eval_metrics["test_actuals"]
+            test_preds = eval_metrics["test_predictions"]
+
+            anomalies_list, anom_summary = detect_anomalies_from_residuals(
+                timestamps=test_timestamps,
+                actuals=test_actuals,
+                predictions=test_preds,
+                validation_thresholds=thresholds,
+                percentile=95.0
+            )
+
+            # Build prediction points
+            predictions_list = []
+            for ts, act, pred in zip(test_timestamps, test_actuals, test_preds):
+                res = act - pred
+                is_anom = res > thresh_95
+                predictions_list.append({
+                    "timestamp": ts,
+                    "actual": round(float(act), 3),
+                    "predicted": round(float(pred), 3),
+                    "residual": round(float(res), 3),
+                    "is_anomaly": bool(is_anom)
+                })
+
+            # Save state
+            self.keras_models[model_type.upper()] = model
+            self.metrics[model_type.upper()] = eval_metrics
+            self.current_model_name = model_type.upper()
+            self.predictions = predictions_list
+            self.anomalies = anomalies_list
+            self.anomaly_threshold_kw = thresh_95
+            self.validation_thresholds = thresholds
+            self.is_trained = True
 
             return {
-                "raw_metadata": raw_meta,
-                "resample_stats": resample_stats,
-                "split_info": split_info
-            }
-
-    def _try_restore_saved_state(self):
-        """Attempts to restore state if files exist on startup."""
-        try:
-            # Check if processed data exists
-            if os.path.exists(PROCESSED_DATA_PATH):
-                hourly = pd.read_csv(PROCESSED_DATA_PATH)
-                hourly['timestamp'] = pd.to_datetime(hourly['timestamp'])
-                splits, scaler, split_info = prepare_dataset_splits(hourly)
-                self.hourly_df = hourly
-                self.splits = splits
-                self.scaler = scaler
-                self.split_info = split_info
-                self.is_dataset_loaded = True
-                self.source_type = "cached"
-                self.dataset_filename = "hourly_consumption.csv"
-
-            # Check if models & metadata exist
-            metadata_file = os.path.join(ARTIFACTS_DIR, "model_metadata.json")
-            lstm_path = os.path.join(MODELS_DIR, "lstm_model.keras")
-            gru_path = os.path.join(MODELS_DIR, "gru_model.keras")
-
-            if os.path.exists(metadata_file) and os.path.exists(lstm_path) and os.path.exists(gru_path):
-                import tensorflow as tf
-                with open(metadata_file, 'r') as f:
-                    meta = json.load(f)
-                self.keras_models["LSTM"] = tf.keras.models.load_model(lstm_path)
-                self.keras_models["GRU"] = tf.keras.models.load_model(gru_path)
-                self.metrics = meta.get("metrics", {})
-                self.best_model_name = meta.get("best_model_name")
-                self.selection_reason = meta.get("selection_reason", "")
-                self.validation_thresholds = {float(k): float(v) for k, v in meta.get("validation_thresholds", {}).items()}
-                self.models_trained = True
-                print("Successfully restored existing trained models and metadata.")
-        except Exception as e:
-            print(f"Note: Could not restore previous state ({e}). Starting fresh.")
-
-    def save_trained_state(self, metrics: Dict[str, Any], best_model_name: str, selection_reason: str, thresholds: Dict[float, float]):
-        with self.state_lock:
-            self.metrics = metrics
-            self.best_model_name = best_model_name
-            self.selection_reason = selection_reason
-            self.validation_thresholds = thresholds
-            self.models_trained = True
-
-            meta_data = {
-                "best_model_name": best_model_name,
-                "selection_reason": selection_reason,
-                "validation_thresholds": {str(k): v for k, v in thresholds.items()},
+                "model_name": model_type.upper(),
                 "metrics": {
-                    name: {k: v for k, v in m.items() if k not in ["val_residuals", "test_predictions", "test_actuals"]}
-                    for name, m in metrics.items()
+                    "mae": eval_metrics["test_mae"],
+                    "rmse": eval_metrics["test_rmse"],
+                    "val_mae": eval_metrics["val_mae"],
+                    "val_rmse": eval_metrics["val_rmse"],
+                    "test_r2": eval_metrics.get("test_r2", 0.0),
+                    "training_time_seconds": eval_metrics["training_duration_seconds"],
+                    "epochs_trained": eval_metrics["epochs_trained"],
+                    "parameters_count": eval_metrics["architecture"]["total_parameters"]
                 },
-                "saved_at": datetime.now().isoformat()
+                "anomaly_threshold_kw": round(thresh_95, 4),
+                "total_anomalies": len(anomalies_list),
+                "sample_predictions": predictions_list[:100],
+                "total_prediction_points": len(predictions_list),
+                "anomalies": anomalies_list,
+                "disclaimer": "An anomaly indicates an unusually high consumption reading relative to predicted demand, not necessarily proof of electricity wastage or equipment failure."
             }
-            os.makedirs(ARTIFACTS_DIR, exist_ok=True)
-            with open(os.path.join(ARTIFACTS_DIR, "model_metadata.json"), 'w') as f:
-                json.dump(meta_data, f, indent=2)
+
+    def train_and_compare_both(
+        self,
+        epochs: int = 12,
+        batch_size: int = 64
+    ) -> Dict[str, Any]:
+        """
+        Trains both LSTM and GRU sequentially using the exact same split and seeds.
+        Compares side-by-side on Val/Test MAE, RMSE, training time, and parameters.
+        Selects best model strictly based on lower Validation MAE.
+        """
+        with self.state_lock:
+            if not self.is_preprocessed or self.splits is None:
+                if self.is_dataset_loaded and self.raw_file_path:
+                    self.preprocess_dataset()
+                else:
+                    raise ValueError("No dataset loaded or preprocessed.")
+
+            splits = self.splits
+            scaler = self.scaler
+
+            # 1. Train LSTM
+            lstm_model, lstm_info = train_single_model(
+                model_type="lstm",
+                X_train=splits["X_train"],
+                y_train=splits["y_train"],
+                X_val=splits["X_val"],
+                y_val=splits["y_val"],
+                epochs=epochs,
+                batch_size=batch_size,
+                patience=3
+            )
+            lstm_eval = evaluate_model_on_splits(
+                model=lstm_model,
+                model_name="LSTM",
+                scaler=scaler,
+                splits=splits,
+                training_info=lstm_info
+            )
+
+            # 2. Train GRU
+            gru_model, gru_info = train_single_model(
+                model_type="gru",
+                X_train=splits["X_train"],
+                y_train=splits["y_train"],
+                X_val=splits["X_val"],
+                y_val=splits["y_val"],
+                epochs=epochs,
+                batch_size=batch_size,
+                patience=3
+            )
+            gru_eval = evaluate_model_on_splits(
+                model=gru_model,
+                model_name="GRU",
+                scaler=scaler,
+                splits=splits,
+                training_info=gru_info
+            )
+
+            # 3. Model Selection based strictly on Validation MAE
+            if lstm_eval["val_mae"] <= gru_eval["val_mae"]:
+                best_name = "LSTM"
+                best_reason = f"LSTM achieved lower Validation MAE ({lstm_eval['val_mae']:.4f} kW vs {gru_eval['val_mae']:.4f} kW)."
+                winning_eval = lstm_eval
+            else:
+                best_name = "GRU"
+                best_reason = f"GRU achieved lower Validation MAE ({gru_eval['val_mae']:.4f} kW vs {lstm_eval['val_mae']:.4f} kW)."
+                winning_eval = gru_eval
+
+            # 4. Anomaly Threshold from best model's validation positive residuals
+            thresholds = compute_validation_thresholds(winning_eval["val_residuals"])
+            thresh_95 = thresholds.get(95.0, 0.5)
+
+            # 5. Anomalies on Test Set
+            test_timestamps = [str(ts) for ts in splits["ts_test"]]
+            test_actuals = winning_eval["test_actuals"]
+            test_preds_best = winning_eval["test_predictions"]
+            lstm_preds = lstm_eval["test_predictions"]
+            gru_preds = gru_eval["test_predictions"]
+
+            anomalies_list, _ = detect_anomalies_from_residuals(
+                timestamps=test_timestamps,
+                actuals=test_actuals,
+                predictions=test_preds_best,
+                validation_thresholds=thresholds,
+                percentile=95.0
+            )
+
+            # 6. Combined Prediction Points
+            predictions_list = []
+            for ts, act, l_pred, g_pred in zip(test_timestamps, test_actuals, lstm_preds, gru_preds):
+                b_pred = l_pred if best_name == "LSTM" else g_pred
+                res = act - b_pred
+                is_anom = res > thresh_95
+                predictions_list.append({
+                    "timestamp": ts,
+                    "actual": round(float(act), 3),
+                    "predicted": round(float(b_pred), 3),
+                    "lstm_predicted": round(float(l_pred), 3),
+                    "gru_predicted": round(float(g_pred), 3),
+                    "residual": round(float(res), 3),
+                    "is_anomaly": bool(is_anom)
+                })
+
+            # Comparison Table
+            comparison_table = [
+                {
+                    "model": "LSTM",
+                    "val_mae": lstm_eval["val_mae"],
+                    "val_rmse": lstm_eval["val_rmse"],
+                    "test_mae": lstm_eval["test_mae"],
+                    "test_rmse": lstm_eval["test_rmse"],
+                    "test_r2": lstm_eval.get("test_r2", 0.0),
+                    "training_time_seconds": lstm_eval["training_duration_seconds"],
+                    "epochs_trained": lstm_eval["epochs_trained"],
+                    "parameters": lstm_eval["architecture"]["total_parameters"],
+                    "is_best": best_name == "LSTM"
+                },
+                {
+                    "model": "GRU",
+                    "val_mae": gru_eval["val_mae"],
+                    "val_rmse": gru_eval["val_rmse"],
+                    "test_mae": gru_eval["test_mae"],
+                    "test_rmse": gru_eval["test_rmse"],
+                    "test_r2": gru_eval.get("test_r2", 0.0),
+                    "training_time_seconds": gru_eval["training_duration_seconds"],
+                    "epochs_trained": gru_eval["epochs_trained"],
+                    "parameters": gru_eval["architecture"]["total_parameters"],
+                    "is_best": best_name == "GRU"
+                }
+            ]
+
+            # Save state
+            self.keras_models["LSTM"] = lstm_model
+            self.keras_models["GRU"] = gru_model
+            self.metrics["LSTM"] = lstm_eval
+            self.metrics["GRU"] = gru_eval
+            self.current_model_name = "COMPARE"
+            self.comparison_table = comparison_table
+            self.best_model_name = best_name
+            self.best_model_reason = best_reason
+            self.predictions = predictions_list
+            self.anomalies = anomalies_list
+            self.anomaly_threshold_kw = thresh_95
+            self.validation_thresholds = thresholds
+            self.is_trained = True
+
+            return {
+                "comparison_table": comparison_table,
+                "best_model": best_name,
+                "best_model_reason": best_reason,
+                "models": {
+                    "LSTM": {
+                        "test_mae": lstm_eval["test_mae"],
+                        "test_rmse": lstm_eval["test_rmse"],
+                        "val_mae": lstm_eval["val_mae"],
+                        "val_rmse": lstm_eval["val_rmse"],
+                        "training_time_seconds": lstm_eval["training_duration_seconds"]
+                    },
+                    "GRU": {
+                        "test_mae": gru_eval["test_mae"],
+                        "test_rmse": gru_eval["test_rmse"],
+                        "val_mae": gru_eval["val_mae"],
+                        "val_rmse": gru_eval["val_rmse"],
+                        "training_time_seconds": gru_eval["training_duration_seconds"]
+                    }
+                },
+                "anomaly_threshold_kw": round(thresh_95, 4),
+                "total_anomalies": len(anomalies_list),
+                "sample_predictions": predictions_list[:100],
+                "total_prediction_points": len(predictions_list),
+                "anomalies": anomalies_list,
+                "disclaimer": "An anomaly indicates an unusually high consumption reading relative to predicted demand, not necessarily proof of electricity wastage or equipment failure."
+            }
+
+    def get_predictions(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Returns predictions on test set."""
+        if not self.is_trained or not self.predictions:
+            return []
+        if limit:
+            return self.predictions[:limit]
+        return self.predictions
+
+    def get_anomalies(self) -> Dict[str, Any]:
+        """Returns detected anomalies on test set with summary and disclaimer."""
+        return {
+            "total_anomalies": len(self.anomalies),
+            "anomaly_threshold_kw": round(self.anomaly_threshold_kw, 4),
+            "anomalies": self.anomalies,
+            "disclaimer": "An anomaly indicates an unusually high reading, not proof of electricity wastage or equipment failure."
+        }
+
+    def get_comparison(self) -> Dict[str, Any]:
+        """Returns model comparison results if both models were evaluated."""
+        return {
+            "comparison_table": self.comparison_table,
+            "best_model": self.best_model_name,
+            "best_model_reason": self.best_model_reason
+        }
+
+    # CSV Generators
+    def generate_predictions_csv(self) -> str:
+        if not self.predictions:
+            return "timestamp,actual_kw,predicted_kw,residual_kw,is_anomaly\n"
+        df = pd.DataFrame(self.predictions)
+        return df.to_csv(index=False)
+
+    def generate_anomalies_csv(self) -> str:
+        if not self.anomalies:
+            return "id,timestamp,actual,predicted,residual,threshold,severity\n"
+        df = pd.DataFrame(self.anomalies)
+        return df.to_csv(index=False)
+
+    def generate_comparison_csv(self) -> str:
+        if not self.comparison_table:
+            return "model,val_mae,val_rmse,test_mae,test_rmse,training_time_seconds,parameters,is_best\n"
+        df = pd.DataFrame(self.comparison_table)
+        return df.to_csv(index=False)
+
 
 state_manager = StateManager()

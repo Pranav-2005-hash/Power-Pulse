@@ -1,136 +1,98 @@
 import axios from 'axios';
 import {
-  DatasetStatus, DatasetPreview, AnalyticsSummary,
-  ConsumptionPoint, PatternsResponse, TrainStatus,
-  ModelComparison, ForecastResponse, AnomaliesResponse
+  DatasetPreview,
+  PreprocessingSummary,
+  TrainResponse,
+  PredictionPoint,
+  AnomaliesResponse
 } from '../types';
 
-const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000/api';
+const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
 
 export const apiClient = axios.create({
   baseURL: BASE_URL,
-  timeout: 45000,
+  timeout: 120000, // 2 minutes for training deep learning models
   headers: {
     'Content-Type': 'application/json',
   },
 });
 
 export const api = {
-  // Health
+  // System Health
   checkHealth: async () => {
     const res = await apiClient.get('/health');
     return res.data;
   },
 
-  // Dataset
-  getDatasetStatus: async (): Promise<DatasetStatus> => {
-    const res = await apiClient.get<DatasetStatus>('/dataset/status');
-    return res.data;
-  },
-
-  loadSampleDataset: async (): Promise<DatasetStatus> => {
-    const res = await apiClient.post<DatasetStatus>('/dataset/load-sample');
-    return res.data;
-  },
-
-  uploadDataset: async (file: File, timestampCol?: string, consumptionCol?: string) => {
+  // Dataset Upload & Preview
+  uploadDataset: async (file: File) => {
     const formData = new FormData();
     formData.append('file', file);
-    if (timestampCol) formData.append('timestamp_column', timestampCol);
-    if (consumptionCol) formData.append('consumption_column', consumptionCol);
-
-    const res = await apiClient.post('/dataset/upload', formData, {
+    const res = await apiClient.post('/upload', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     });
     return res.data;
   },
 
-  getDatasetPreview: async (page = 1, pageSize = 50): Promise<DatasetPreview> => {
-    const res = await apiClient.get<DatasetPreview>('/dataset/preview', {
-      params: { page, page_size: pageSize },
+  loadSampleDataset: async () => {
+    const res = await apiClient.post('/upload/sample');
+    return res.data;
+  },
+
+  getDatasetPreview: async (): Promise<DatasetPreview> => {
+    const res = await apiClient.get<DatasetPreview>('/dataset/preview');
+    return res.data;
+  },
+
+  // Preprocessing
+  preprocessDataset: async (targetColumn?: string, datetimeColumn?: string): Promise<PreprocessingSummary> => {
+    const res = await apiClient.post<PreprocessingSummary>('/preprocess', {
+      target_column: targetColumn,
+      datetime_column: datetimeColumn,
     });
     return res.data;
   },
 
-  // Analytics
-  getAnalyticsSummary: async (): Promise<AnalyticsSummary> => {
-    const res = await apiClient.get<AnalyticsSummary>('/analytics/summary');
-    return res.data;
-  },
-
-  getConsumptionSeries: async (startDate?: string, endDate?: string, limit = 1000): Promise<ConsumptionPoint[]> => {
-    const res = await apiClient.get<ConsumptionPoint[]>('/analytics/consumption', {
-      params: { start_date: startDate, end_date: endDate, limit },
-    });
-    return res.data;
-  },
-
-  getConsumptionPatterns: async (): Promise<PatternsResponse> => {
-    const res = await apiClient.get<PatternsResponse>('/analytics/patterns');
-    return res.data;
-  },
-
-  // Models
-  triggerTraining: async (epochs = 15, batchSize = 64): Promise<TrainStatus> => {
-    const res = await apiClient.post<TrainStatus>('/models/train', {
+  // Model Training
+  trainLSTM: async (epochs = 12, batchSize = 64): Promise<TrainResponse> => {
+    const res = await apiClient.post<TrainResponse>('/train/lstm', {
       epochs,
       batch_size: batchSize,
     });
     return res.data;
   },
 
-  getTrainingStatus: async (): Promise<TrainStatus> => {
-    const res = await apiClient.get<TrainStatus>('/models/status');
-    return res.data;
-  },
-
-  getModelMetrics: async () => {
-    const res = await apiClient.get('/models/metrics');
-    return res.data;
-  },
-
-  getModelComparison: async (): Promise<ModelComparison> => {
-    const res = await apiClient.get<ModelComparison>('/models/compare');
-    return res.data;
-  },
-
-  // Forecasting
-  executeForecast: async (model: string, horizon: number): Promise<ForecastResponse> => {
-    const res = await apiClient.post<ForecastResponse>('/forecast', {
-      model,
-      horizon,
+  trainGRU: async (epochs = 12, batchSize = 64): Promise<TrainResponse> => {
+    const res = await apiClient.post<TrainResponse>('/train/gru', {
+      epochs,
+      batch_size: batchSize,
     });
     return res.data;
   },
 
-  // Anomalies
-  getAnomalies: async (thresholdPercentile = 95.0, status = 'all'): Promise<AnomaliesResponse> => {
-    const res = await apiClient.get<AnomaliesResponse>('/anomalies', {
-      params: { threshold_percentile: thresholdPercentile, status },
+  trainCompare: async (epochs = 12, batchSize = 64): Promise<TrainResponse> => {
+    const res = await apiClient.post<TrainResponse>('/train/compare', {
+      epochs,
+      batch_size: batchSize,
     });
     return res.data;
   },
 
-  recalculateAnomalies: async (percentile: number): Promise<AnomaliesResponse> => {
-    const res = await apiClient.post<AnomaliesResponse>('/anomalies/recalculate', {
-      percentile,
+  // Results
+  getPredictions: async (limit = 500): Promise<{ predictions: PredictionPoint[]; total_test_samples: number }> => {
+    const res = await apiClient.get('/results/predictions', {
+      params: { limit },
     });
     return res.data;
   },
 
-  reviewAnomaly: async (anomalyId: string, reviewed: boolean) => {
-    const res = await apiClient.post('/anomalies/review', {
-      anomaly_id: anomalyId,
-      reviewed,
-    });
+  getAnomalies: async (): Promise<AnomaliesResponse> => {
+    const res = await apiClient.get<AnomaliesResponse>('/results/anomalies');
     return res.data;
   },
 
-  // Reports download URLs
-  getForecastCsvUrl: () => `${BASE_URL}/reports/forecast.csv`,
-  getAnomaliesCsvUrl: () => `${BASE_URL}/reports/anomalies.csv`,
-  getModelComparisonCsvUrl: () => `${BASE_URL}/reports/model-comparison.csv`,
-  getProcessedDataCsvUrl: () => `${BASE_URL}/reports/processed-data.csv`,
-  getEvaluationJsonUrl: () => `${BASE_URL}/reports/evaluation.json`,
-  getHtmlReportUrl: () => `${BASE_URL}/reports/summary.html`,
+  // Download URLs
+  getPredictionsCsvUrl: () => `${BASE_URL}/download/predictions`,
+  getAnomaliesCsvUrl: () => `${BASE_URL}/download/anomalies`,
+  getComparisonCsvUrl: () => `${BASE_URL}/download/comparison`,
 };
