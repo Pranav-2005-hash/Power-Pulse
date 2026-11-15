@@ -16,7 +16,7 @@ class PreprocessRequest(BaseModel):
 
 
 @router.post("/upload")
-async def upload_dataset(file: UploadFile = File(...)):
+def upload_dataset(file: UploadFile = File(...)):
     """
     Uploads and validates electricity consumption CSV.
     Returns preview of first 10 rows, dimensions, and auto-detected columns.
