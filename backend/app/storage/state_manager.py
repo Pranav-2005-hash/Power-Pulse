@@ -582,18 +582,30 @@ class StateManager:
     ) -> Dict[str, Any]:
         """
         Rolls forward 24 hourly recursive predictions using the last 24 hours of available data.
-        Applies a short-term trend correction from the past 12 hours and computes
-        95% expanding confidence bounds.
+
+        Strategy to avoid flat-line collapse:
+        - Run the auto-regressive rollout to capture recent demand level.
+        - Compute a diurnal hourly profile (mean kW per hour-of-day) from ALL available data.
+        - For each forecast step, blend the model's level with the historical pattern shape:
+              forecast = 0.35 * ar_pred + 0.65 * (recent_24h_mean * diurnal_ratio)
+          This ensures the forecast follows the realistic morning/evening peak pattern
+          while the model still anchors the absolute level to the latest observed data.
+        - Apply expanding 95% confidence intervals.
         """
         if self.hourly_df is None or len(self.hourly_df) < SEQUENCE_LENGTH:
             return {}
 
-        # Last 24 hours: conditioning window for the model
+        # ── History ──────────────────────────────────────────────────────────
         last_24_df = self.hourly_df.iloc[-SEQUENCE_LENGTH:]
         last_timestamp = pd.to_datetime(last_24_df['timestamp'].iloc[-1])
         last_reading_kw = float(last_24_df['Global_active_power'].iloc[-1])
 
-        # Past 12 hours: historical context shown in the chart
+        # Recent 24-hour mean: anchors the diurnal pattern to recent activity level
+        recent_24h_mean = float(last_24_df['Global_active_power'].mean())
+        if recent_24h_mean <= 0:
+            recent_24h_mean = float(self.hourly_df['Global_active_power'].mean())
+
+        # Past 12 hours shown in chart as ground-truth context
         history_12_df = self.hourly_df.iloc[-12:]
         history_context = [
             {
@@ -604,37 +616,56 @@ class StateManager:
             for _, row in history_12_df.iterrows()
         ]
 
-        # Compute recent short-term trend (average hourly delta over last 12 hours)
-        recent_vals = history_12_df['Global_active_power'].values.astype(float)
-        recent_changes = [recent_vals[i] - recent_vals[i - 1] for i in range(1, len(recent_vals))]
-        avg_trend = float(np.mean(recent_changes)) if recent_changes else 0.0
-        # Dampen trend so it doesn't explode over 24 hours
-        avg_trend = np.clip(avg_trend, -0.05, 0.05)
+        # ── Diurnal Profile ───────────────────────────────────────────────────
+        # Learn average consumption at each hour-of-day (0-23) from full dataset.
+        # This captures morning ramp, daytime dip, evening peak patterns.
+        df_tmp = self.hourly_df.copy()
+        df_tmp['_hour'] = pd.to_datetime(df_tmp['timestamp']).dt.hour
+        hourly_profile = df_tmp.groupby('_hour')['Global_active_power'].mean()
+        profile_mean = float(hourly_profile.mean())
+        if profile_mean <= 0:
+            profile_mean = 1.0
 
-        # Build scaled initial window for the model
+        # ── Auto-Regressive Rollout ───────────────────────────────────────────
         raw_window = last_24_df['Global_active_power'].values.reshape(-1, 1)
         scaled_window = self.scaler.transform(raw_window)
         current_window = scaled_window.reshape(1, SEQUENCE_LENGTH, 1).copy()
 
+        ar_predictions = []  # raw model rollout values (kW)
+        for _ in range(24):
+            pred_scaled = float(model.predict(current_window, verbose=0)[0, 0])
+            pred_kw = max(0.0, float(self.scaler.inverse_transform([[pred_scaled]])[0, 0]))
+            ar_predictions.append((pred_scaled, pred_kw))
+            new_step = np.array([[[pred_scaled]]])
+            current_window = np.concatenate([current_window[:, 1:, :], new_step], axis=1)
+
+        # ── Blend & Build Forecast Points ─────────────────────────────────────
         forecast_points = []
         cumulative_kwh = 0.0
 
         for h in range(1, 25):
-            # 1-step ahead prediction from the model
-            pred_scaled = float(model.predict(current_window, verbose=0)[0, 0])
-            pred_kw = float(self.scaler.inverse_transform([[pred_scaled]])[0, 0])
-            pred_kw = max(0.0, pred_kw)
+            pred_scaled, ar_pred = ar_predictions[h - 1]
 
-            # Apply dampened trend correction
-            forecast_kw = max(0.0, pred_kw + avg_trend * h)
+            # Target hour-of-day for this forecast step
+            proj_time = last_timestamp + pd.Timedelta(hours=h)
+            target_hour = int(proj_time.hour)
+            timestamp_str = proj_time.strftime("%Y-%m-%d %H:%M:%S")
 
-            # Expanding 95% confidence interval (uncertainty grows with horizon)
+            # Diurnal pattern contribution: scale recent mean by the hour-of-day ratio
+            hour_mean = float(hourly_profile.get(target_hour, profile_mean))
+            diurnal_ratio = hour_mean / profile_mean
+            pattern_pred = recent_24h_mean * diurnal_ratio
+
+            # Weighted blend: 35% model level + 65% diurnal pattern
+            # As horizon grows, trust the pattern more (model collapses after ~6 steps)
+            model_weight = max(0.15, 0.50 - 0.015 * h)   # 0.50 at h=1 → 0.15 at h=24
+            pattern_weight = 1.0 - model_weight
+            forecast_kw = max(0.0, model_weight * ar_pred + pattern_weight * pattern_pred)
+
+            # Expanding 95% confidence interval
             margin = 1.96 * test_rmse * (1.0 + 0.05 * np.sqrt(h))
             upper_bound = round(forecast_kw + margin, 3)
             lower_bound = round(max(0.0, forecast_kw - margin), 3)
-
-            proj_time = last_timestamp + pd.Timedelta(hours=h)
-            timestamp_str = proj_time.strftime("%Y-%m-%d %H:%M:%S")
 
             forecast_points.append({
                 "hour_ahead": h,
@@ -646,10 +677,6 @@ class StateManager:
             })
 
             cumulative_kwh += forecast_kw
-
-            # Slide window forward using the raw model prediction (not trend-adjusted)
-            new_step = np.array([[[pred_scaled]]])
-            current_window = np.concatenate([current_window[:, 1:, :], new_step], axis=1)
 
         kw_values = [p["forecast_kw"] for p in forecast_points]
         max_idx = int(np.argmax(kw_values))
