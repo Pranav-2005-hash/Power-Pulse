@@ -62,6 +62,9 @@ class StateManager:
         self.anomaly_threshold_kw: float = 0.0
         self.validation_thresholds: Dict[float, float] = {}
 
+        # 24-Hour Forward Forecast
+        self.forecast_24h: Optional[Dict[str, Any]] = None
+
     def save_raw_upload(self, file_path: str, filename: str) -> Dict[str, Any]:
         """
         Inspects raw uploaded CSV, extracts column types, preview of first 10 rows,
@@ -151,6 +154,7 @@ class StateManager:
             self.predictions = []
             self.anomalies = []
             self.comparison_table = []
+            self.forecast_24h = None
 
             return self.raw_metadata
 
@@ -223,6 +227,7 @@ class StateManager:
             self.predictions = []
             self.anomalies = []
             self.comparison_table = []
+            self.forecast_24h = None
 
             return summary
 
@@ -309,6 +314,13 @@ class StateManager:
             self.validation_thresholds = thresholds
             self.is_trained = True
 
+            # Generate 24-hour forward forecast using this trained model
+            forecast_24h = self._compute_24h_forecast(
+                model=model,
+                model_name=model_type.upper(),
+                test_rmse=eval_metrics["test_rmse"]
+            )
+
             return {
                 "model_name": model_type.upper(),
                 "metrics": {
@@ -326,6 +338,7 @@ class StateManager:
                 "sample_predictions": predictions_list[:100],
                 "total_prediction_points": len(predictions_list),
                 "anomalies": anomalies_list,
+                "forecast_24h": forecast_24h,
                 "disclaimer": "An anomaly indicates an unusually high consumption reading relative to predicted demand, not necessarily proof of electricity wastage or equipment failure."
             }
 
@@ -475,6 +488,17 @@ class StateManager:
             self.validation_thresholds = thresholds
             self.is_trained = True
 
+            # Generate 24-hour forward forecast using the winning best model
+            winning_model = lstm_model if best_name == "LSTM" else gru_model
+            winning_rmse = winning_eval["test_rmse"]
+            forecast_24h = self._compute_24h_forecast(
+                model=winning_model,
+                model_name=best_name,
+                test_rmse=winning_rmse,
+                is_best=True,
+                best_reason=best_reason
+            )
+
             return {
                 "comparison_table": comparison_table,
                 "best_model": best_name,
@@ -500,6 +524,7 @@ class StateManager:
                 "sample_predictions": predictions_list[:100],
                 "total_prediction_points": len(predictions_list),
                 "anomalies": anomalies_list,
+                "forecast_24h": forecast_24h,
                 "disclaimer": "An anomaly indicates an unusually high consumption reading relative to predicted demand, not necessarily proof of electricity wastage or equipment failure."
             }
 
@@ -545,6 +570,139 @@ class StateManager:
         if not self.comparison_table:
             return "model,val_mae,val_rmse,test_mae,test_rmse,training_time_seconds,parameters,is_best\n"
         df = pd.DataFrame(self.comparison_table)
+        return df.to_csv(index=False)
+
+    def _compute_24h_forecast(
+        self,
+        model,
+        model_name: str,
+        test_rmse: float,
+        is_best: bool = False,
+        best_reason: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Rolls forward 24 hourly recursive predictions using the last 24 hours of available data.
+        Computes 95% expanding confidence bounds.
+        """
+        if self.hourly_df is None or len(self.hourly_df) < SEQUENCE_LENGTH:
+            return {}
+
+        # Last 24 hours from data
+        last_24_df = self.hourly_df.iloc[-SEQUENCE_LENGTH:]
+        last_timestamp = pd.to_datetime(last_24_df['timestamp'].iloc[-1])
+        last_reading_kw = float(last_24_df['Global_active_power'].iloc[-1])
+
+        # Past 12 hours of actual history for visualization context
+        history_12_df = self.hourly_df.iloc[-12:]
+        history_context = [
+            {
+                "timestamp": str(row['timestamp']),
+                "actual_kw": round(float(row['Global_active_power']), 3),
+                "is_historical": True
+            }
+            for _, row in history_12_df.iterrows()
+        ]
+
+        # Scaled initial window
+        raw_window = last_24_df['Global_active_power'].values.reshape(-1, 1)
+        scaled_window = self.scaler.transform(raw_window)
+        current_window = scaled_window.reshape(1, SEQUENCE_LENGTH, 1).copy()
+
+        forecast_points = []
+        cumulative_kwh = 0.0
+
+        for h in range(1, 25):
+            # Predict next step
+            pred_scaled = float(model.predict(current_window, verbose=0)[0, 0])
+            pred_kw = float(self.scaler.inverse_transform([[pred_scaled]])[0, 0])
+            pred_kw = max(0.0, pred_kw)
+
+            # 95% Confidence Interval (expanding uncertainty margin)
+            margin = 1.96 * test_rmse * (1.0 + 0.05 * np.sqrt(h))
+            upper_bound = round(pred_kw + margin, 3)
+            lower_bound = round(max(0.0, pred_kw - margin), 3)
+
+            proj_time = last_timestamp + pd.Timedelta(hours=h)
+            timestamp_str = proj_time.strftime("%Y-%m-%d %H:%M:%S")
+
+            forecast_points.append({
+                "hour_ahead": h,
+                "timestamp": timestamp_str,
+                "forecast_kw": round(pred_kw, 3),
+                "lower_bound_kw": lower_bound,
+                "upper_bound_kw": upper_bound,
+                "confidence_margin_kw": round(margin, 3)
+            })
+
+            cumulative_kwh += pred_kw
+
+            # Slide window forward
+            new_step = np.array([[[pred_scaled]]])
+            current_window = np.concatenate([current_window[:, 1:, :], new_step], axis=1)
+
+        kw_values = [p["forecast_kw"] for p in forecast_points]
+        max_idx = int(np.argmax(kw_values))
+        min_idx = int(np.argmin(kw_values))
+
+        selection_rationale = best_reason if (is_best and best_reason) else f"Trained {model_name} recurrent neural network"
+
+        forecast_result = {
+            "model_used": model_name,
+            "is_best_model": is_best,
+            "selection_rationale": selection_rationale,
+            "base_timestamp": last_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "last_known_reading_kw": round(last_reading_kw, 3),
+            "total_projected_kwh": round(cumulative_kwh, 2),
+            "average_forecast_kw": round(float(np.mean(kw_values)), 3),
+            "peak_hour": forecast_points[max_idx]["timestamp"],
+            "peak_forecast_kw": forecast_points[max_idx]["forecast_kw"],
+            "min_hour": forecast_points[min_idx]["timestamp"],
+            "min_forecast_kw": forecast_points[min_idx]["forecast_kw"],
+            "forecast_points": forecast_points,
+            "history_context": history_context
+        }
+
+        self.forecast_24h = forecast_result
+        return forecast_result
+
+    def predict_next_24_hours(self, model_choice: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Public method to predict next 24 hours of electricity consumption using the best model
+        or selected model on demand.
+        """
+        with self.state_lock:
+            if not self.is_trained or not self.keras_models:
+                raise ValueError("No model is trained yet. Please train LSTM or GRU first.")
+
+            # Model selection: best model preferred
+            if model_choice and model_choice.upper() in self.keras_models:
+                selected_name = model_choice.upper()
+            elif self.best_model_name and self.best_model_name in self.keras_models:
+                selected_name = self.best_model_name
+            elif "LSTM" in self.keras_models:
+                selected_name = "LSTM"
+            elif "GRU" in self.keras_models:
+                selected_name = "GRU"
+            else:
+                selected_name = list(self.keras_models.keys())[0]
+
+            model = self.keras_models[selected_name]
+            test_rmse = self.metrics.get(selected_name, {}).get("test_rmse", 0.35)
+            is_best = (selected_name == self.best_model_name)
+            best_reason = self.best_model_reason if is_best else None
+
+            return self._compute_24h_forecast(
+                model=model,
+                model_name=selected_name,
+                test_rmse=test_rmse,
+                is_best=is_best,
+                best_reason=best_reason
+            )
+
+    def generate_forecast_csv(self) -> str:
+        if not self.forecast_24h or not self.forecast_24h.get("forecast_points"):
+            return "Hour_Ahead,Timestamp,Forecast_kW,Lower_Bound_kW,Upper_Bound_kW,Confidence_Margin_kW\n"
+        df = pd.DataFrame(self.forecast_24h["forecast_points"])
         return df.to_csv(index=False)
 
 

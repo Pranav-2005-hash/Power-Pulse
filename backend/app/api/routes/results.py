@@ -56,6 +56,26 @@ def get_model_comparison():
     return state_manager.get_comparison()
 
 
+@router.get("/results/forecast/24h")
+@router.post("/results/forecast/24h")
+def get_24h_forecast(model: Optional[str] = None):
+    """
+    Returns roll-forward 24-hour future electricity consumption predictions
+    using the best model (or specified model) starting from the end of the dataset.
+    """
+    if not state_manager.is_trained:
+        raise HTTPException(
+            status_code=400,
+            detail="No model has been trained yet. Please train LSTM or GRU first."
+        )
+
+    try:
+        forecast = state_manager.predict_next_24_hours(model_choice=model)
+        return forecast
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"24-hour forecast error: {str(e)}")
+
+
 # CSV Downloads
 @router.get("/download/predictions")
 def download_predictions_csv():
@@ -93,5 +113,18 @@ def download_comparison_csv():
         content=csv_content,
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=powerpulse_model_comparison.csv"}
+    )
+
+
+@router.get("/download/forecast")
+def download_forecast_csv():
+    """
+    Streams CSV of the 24-hour future electricity consumption forecast.
+    """
+    csv_content = state_manager.generate_forecast_csv()
+    return Response(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=powerpulse_24h_forecast.csv"}
     )
 

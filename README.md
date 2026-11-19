@@ -45,8 +45,15 @@ The application focuses on demonstrating the genuine deep-learning and statistic
      - Severity classification: Critical ($\ge 99\%$), High ($\ge 95\%$), Moderate.
      - Academic disclaimer: *An anomaly indicates an unusually high consumption reading relative to historical patterns, not necessarily proof of equipment failure or energy waste.*
 
-5. **Download Results**:
-   - One-click CSV export for **Predictions**, **Detected Anomalies**, and **Model Comparison**.
+5. **Next 24-Hour Rollout Forecasting (Best Model)**:
+   - **Autonomous Model Selection**: Automatically selects the best-performing architecture (LSTM or GRU) based on lowest Validation MAE, or evaluates the single model trained.
+   - **Recursive Auto-Regressive Rollout**: Ingests the final 24 historical hourly readings $(X_{t-23}, \dots, X_t)$ and iteratively feeds each prediction $\hat{y}_{t+k}$ into the input sequence to generate the next 24 consecutive future hourly points ($t+1$ to $t+24$).
+   - **Dynamic 95% Confidence Bounds**: Multi-step uncertainty propagation envelope calculated via $\text{margin}_k = 1.96 \times \text{RMSE}_{\text{test}} \times (1 + 0.05\sqrt{k})$.
+   - **Key Consumption Telemetry**: Total 24-hour Projected Energy ($kWh$), Projected Peak Demand ($kW$ + timestamp), Base Load ($kW$ + timestamp), and Average Projected Demand ($kW$).
+   - **Dual Horizon Chart**: Interactive Recharts timeline rendering the last 12 observed hours of historical context alongside the next 24 hours of predictions with shaded confidence bands.
+
+6. **Download Results & Forecasts**:
+   - One-click CSV export for **Historical Predictions**, **Detected Anomalies**, **Model Comparison**, and **Next 24-Hour Forecasts**.
 
 ---
 
@@ -78,6 +85,10 @@ The application focuses on demonstrating the genuine deep-learning and statistic
        │ Positive residuals: Residual = Actual - Predicted
        ▼
 [Test Set Anomaly Detection & Comparison Table]
+       │
+       ▼
+[Next 24-Hour Recursive Rollout Forecasting (Best Model: LSTM/GRU)]
+       │ Multi-step rolling forward inference + 95% Confidence Bounds
        ▼
 [Single-Page Responsive UI: Recharts Graphs, Tables & CSV Downloads]
 ```
@@ -123,7 +134,7 @@ npm run dev
 
 ## 4. Automated Tests
 
-Run the full pytest suite (17/17 tests):
+Run the full pytest suite (18/18 tests):
 
 ```powershell
 $env:PYTHONPATH="backend"
@@ -148,6 +159,7 @@ pytest backend/tests -v
 - `test_train_lstm_endpoint`: Real LSTM training and metric computation.
 - `test_train_compare_endpoint`: Sequential training of both LSTM and GRU, comparison matrix generation.
 - `test_results_endpoints_and_downloads`: Predictions, anomalies, and CSV streaming downloads.
+- `test_24h_forecast_endpoint_and_download`: 24-step recursive rollout generation, telemetry, and CSV download.
 
 ---
 
@@ -160,14 +172,17 @@ pytest backend/tests -v
 | `POST` | `/upload/sample` | Load bundled UCI 90-day demo dataset |
 | `GET` | `/dataset/preview` | Preview first 10 rows and dataset summary |
 | `POST` | `/preprocess` | Clean, resample to hourly mean, and split chronologically |
-| `POST` | `/train/lstm` | Train LSTM model and return metrics + predictions + anomalies |
-| `POST` | `/train/gru` | Train GRU model and return metrics + predictions + anomalies |
-| `POST` | `/train/compare` | Train both LSTM and GRU, return comparative metrics and winning rationale |
+| `POST` | `/train/lstm` | Train LSTM model and return metrics + predictions + anomalies + 24h forecast |
+| `POST` | `/train/gru` | Train GRU model and return metrics + predictions + anomalies + 24h forecast |
+| `POST` | `/train/compare` | Train both LSTM and GRU, compare models and generate 24h forecast with the best model |
 | `GET` | `/results/predictions` | Return actual vs. predicted readings on held-out test data |
 | `GET` | `/results/anomalies` | Return detected statistical anomalies on test data |
+| `GET` | `/results/forecast/24h` | Return next 24-hour recursive rollout forecast with 95% confidence intervals |
+| `POST` | `/results/forecast/24h` | Trigger 24-hour forecast with a specific model (`lstm` or `gru`) |
 | `GET` | `/download/predictions` | Download predictions table as CSV |
 | `GET` | `/download/anomalies` | Download detected anomalies as CSV |
 | `GET` | `/download/comparison` | Download LSTM vs. GRU comparison table as CSV |
+| `GET` | `/download/forecast` | Download 24-hour forecast table as CSV |
 
 *(All endpoints are also available with the `/api` prefix, e.g. `/api/upload`)*
 

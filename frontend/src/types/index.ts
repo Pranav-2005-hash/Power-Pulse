@@ -87,6 +87,37 @@ export interface AnomaliesResponse {
   disclaimer: string;
 }
 
+export interface ForecastPoint24h {
+  hour_ahead: number;
+  timestamp: string;
+  forecast_kw: number;
+  lower_bound_kw: number;
+  upper_bound_kw: number;
+  confidence_margin_kw: number;
+}
+
+export interface HistoryContextPoint {
+  timestamp: string;
+  actual_kw: number;
+  is_historical: boolean;
+}
+
+export interface Forecast24hResponse {
+  model_used: string;
+  is_best_model: boolean;
+  selection_rationale: string;
+  base_timestamp: string;
+  last_known_reading_kw: number;
+  total_projected_kwh: number;
+  average_forecast_kw: number;
+  peak_hour: string;
+  peak_forecast_kw: number;
+  min_hour: string;
+  min_forecast_kw: number;
+  forecast_points: ForecastPoint24h[];
+  history_context: HistoryContextPoint[];
+}
+
 export interface TrainResponse {
   model_name?: string;
   metrics?: TrainMetrics;
@@ -98,5 +129,6 @@ export interface TrainResponse {
   comparison_table?: ComparisonRow[];
   best_model?: string;
   best_model_reason?: string;
+  forecast_24h?: Forecast24hResponse;
   disclaimer: string;
 }

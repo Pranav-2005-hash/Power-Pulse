@@ -104,3 +104,22 @@ def test_train_compare_endpoint(client):
     assert res_dl_comp.status_code == 200
     assert "LSTM" in res_dl_comp.text
     assert "GRU" in res_dl_comp.text
+
+def test_24h_forecast_endpoint_and_download(client):
+    # GET /results/forecast/24h
+    res_fc = client.get("/results/forecast/24h")
+    assert res_fc.status_code == 200
+    fc_data = res_fc.json()
+    assert "forecast_points" in fc_data
+    assert len(fc_data["forecast_points"]) == 24
+    assert fc_data["model_used"] in ["LSTM", "GRU"]
+    assert fc_data["total_projected_kwh"] > 0
+    assert fc_data["peak_forecast_kw"] > 0
+    assert "hour_ahead" in fc_data["forecast_points"][0]
+    assert "forecast_kw" in fc_data["forecast_points"][0]
+
+    # Download 24h forecast CSV
+    res_dl = client.get("/download/forecast")
+    assert res_dl.status_code == 200
+    assert "hour_ahead" in res_dl.text.lower()
+    assert "forecast_kw" in res_dl.text.lower()

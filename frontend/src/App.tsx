@@ -16,7 +16,10 @@ import {
   Info,
   Clock,
   Activity,
-  ArrowRight
+  ArrowRight,
+  Zap,
+  Sparkles,
+  Calendar
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -35,7 +38,9 @@ import {
   TrainResponse,
   PredictionPoint,
   ComparisonRow,
-  AnomalyPoint
+  AnomalyPoint,
+  Forecast24hResponse,
+  ForecastPoint24h
 } from './types';
 
 export const App: React.FC = () => {
@@ -65,6 +70,28 @@ export const App: React.FC = () => {
   const [trainResult, setTrainResult] = useState<TrainResponse | null>(null);
   const [activeModelName, setActiveModelName] = useState<string | null>(null);
   const [chartSlice, setChartSlice] = useState<number>(100); // points to display in chart
+
+  // 24-Hour Forecast State
+  const [forecast24h, setForecast24h] = useState<Forecast24hResponse | null>(null);
+  const [isForecasting, setIsForecasting] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (trainResult?.forecast_24h) {
+      setForecast24h(trainResult.forecast_24h);
+    }
+  }, [trainResult]);
+
+  const handleReforecast = async (modelName?: string) => {
+    setIsForecasting(true);
+    try {
+      const data = await api.get24hForecast(modelName);
+      setForecast24h(data);
+    } catch (err: any) {
+      console.error(err);
+    } finally {
+      setIsForecasting(false);
+    }
+  };
 
   useEffect(() => {
     checkHealthAndInitialDataset();
@@ -230,6 +257,48 @@ export const App: React.FC = () => {
     isAnomaly: p.is_anomaly,
   }));
 
+  // Prepare 24-hour future forecast trajectory data
+  const forecastChartData = React.useMemo(() => {
+    if (!forecast24h) return [];
+    const points: any[] = [];
+
+    // Historical 12 hours context
+    (forecast24h.history_context || []).forEach(pt => {
+      const timeStr = pt.timestamp.includes(' ') ? pt.timestamp.split(' ')[1].slice(0, 5) : pt.timestamp.slice(11, 16);
+      points.push({
+        label: timeStr,
+        fullTimestamp: pt.timestamp,
+        HistoricalActual: pt.actual_kw,
+        Forecast24h: null,
+        UpperBound: null,
+        LowerBound: null,
+        isHistorical: true,
+      });
+    });
+
+    // Bridge historical to future
+    if (points.length > 0 && forecast24h.forecast_points && forecast24h.forecast_points.length > 0) {
+      const lastHist = points[points.length - 1];
+      lastHist.Forecast24h = lastHist.HistoricalActual;
+    }
+
+    // 24-hour future predictions
+    (forecast24h.forecast_points || []).forEach(pt => {
+      const timeStr = pt.timestamp.includes(' ') ? pt.timestamp.split(' ')[1].slice(0, 5) : pt.timestamp.slice(11, 16);
+      points.push({
+        label: `+${pt.hour_ahead}h (${timeStr})`,
+        fullTimestamp: pt.timestamp,
+        HistoricalActual: null,
+        Forecast24h: pt.forecast_kw,
+        UpperBound: pt.upper_bound_kw,
+        LowerBound: pt.lower_bound_kw,
+        isHistorical: false,
+      });
+    });
+
+    return points;
+  }, [forecast24h]);
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 font-sans flex flex-col">
       {/* ── A. HEADER ──────────────────────────────────────────────────────── */}
@@ -260,9 +329,15 @@ export const App: React.FC = () => {
               3. Training
             </a>
             {trainResult && (
-              <a href="#results" className="px-3 py-1.5 text-xs font-medium text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded-md transition-colors">
-                4. Results
-              </a>
+              <>
+                <a href="#results" className="px-3 py-1.5 text-xs font-medium text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded-md transition-colors">
+                  4. Results
+                </a>
+                <a href="#forecast24h" className="px-3 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-md transition-colors flex items-center space-x-1">
+                  <Sparkles className="w-3 h-3 text-blue-600" />
+                  <span>5. Next 24h Forecast</span>
+                </a>
+              </>
             )}
           </nav>
 
@@ -941,19 +1016,234 @@ export const App: React.FC = () => {
               </div>
             </section>
 
+            {/* ── 4. NEXT 24 HOURS ELECTRICITY CONSUMPTION FORECAST ─────────────── */}
+            {forecast24h && (
+              <section id="forecast24h" className="bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-6">
+                <div className="flex flex-wrap items-center justify-between pb-4 border-b border-slate-100 gap-2">
+                  <div>
+                    <h2 className="text-lg font-bold text-slate-900 flex items-center space-x-2">
+                      <Sparkles className="w-5 h-5 text-blue-600" />
+                      <span>Next 24 Hours Electricity Consumption Forecast</span>
+                    </h2>
+                    <p className="text-sm text-slate-500">
+                      Roll-forward recursive multi-step forecasting using the optimal architecture ({forecast24h.model_used}) projected from the latest 24-hour readings.
+                    </p>
+                  </div>
+                  <div className="flex items-center space-x-3">
+                    <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-blue-100 text-blue-800">
+                      <Zap className="w-3.5 h-3.5 mr-1 text-blue-600" />
+                      Model: {forecast24h.model_used} {forecast24h.is_best_model ? '(Optimal Model)' : ''}
+                    </span>
+                    <button
+                      onClick={() => handleReforecast()}
+                      disabled={isForecasting}
+                      className="inline-flex items-center px-3 py-1.5 rounded-lg border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs font-semibold transition-colors disabled:opacity-50"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${isForecasting ? 'animate-spin' : ''}`} />
+                      Re-forecast
+                    </button>
+                  </div>
+                </div>
+
+                {/* 4 Forecast Metric Cards */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                  <div className="bg-blue-50/60 border border-blue-200 rounded-xl p-4">
+                    <span className="text-xs font-semibold text-blue-900 uppercase">Total 24h Projected Energy</span>
+                    <p className="text-2xl font-black text-blue-950 mt-1">
+                      {forecast24h.total_projected_kwh.toFixed(2)} <span className="text-xs font-medium text-blue-700">kWh</span>
+                    </p>
+                    <p className="text-2xs text-blue-700 mt-0.5">Cumulative load over next 24 hours</p>
+                  </div>
+
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-4">
+                    <span className="text-xs font-semibold text-slate-500 uppercase">Projected Peak Demand</span>
+                    <p className="text-2xl font-black text-rose-600 mt-1">
+                      {forecast24h.peak_forecast_kw.toFixed(3)} <span className="text-xs font-medium text-slate-500">kW</span>
+                    </p>
+                    <p className="text-2xs text-slate-500 mt-0.5 truncate" title={forecast24h.peak_hour}>
+                      Peak hour: {forecast24h.peak_hour.slice(11, 16) || forecast24h.peak_hour}
+                    </p>
+                  </div>
+
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-4">
+                    <span className="text-xs font-semibold text-slate-500 uppercase">Projected Base Load</span>
+                    <p className="text-2xl font-black text-emerald-600 mt-1">
+                      {forecast24h.min_forecast_kw.toFixed(3)} <span className="text-xs font-medium text-slate-500">kW</span>
+                    </p>
+                    <p className="text-2xs text-slate-500 mt-0.5 truncate" title={forecast24h.min_hour}>
+                      Minimum hour: {forecast24h.min_hour.slice(11, 16) || forecast24h.min_hour}
+                    </p>
+                  </div>
+
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-4">
+                    <span className="text-xs font-semibold text-slate-500 uppercase">Average Forecast Load</span>
+                    <p className="text-2xl font-black text-slate-900 mt-1">
+                      {forecast24h.average_forecast_kw.toFixed(3)} <span className="text-xs font-medium text-slate-500">kW</span>
+                    </p>
+                    <p className="text-2xs text-slate-500 mt-0.5">Last reading: {forecast24h.last_known_reading_kw} kW</p>
+                  </div>
+                </div>
+
+                {/* Model Selection & Roll-forward Rationale Callout */}
+                <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-700 flex items-start space-x-3">
+                  <Info className="w-5 h-5 text-blue-600 shrink-0 mt-0.5" />
+                  <div className="leading-relaxed">
+                    <strong>Forecasting Methodology:</strong> Initialized with the most recent 24-hour historical window ending at <strong>{forecast24h.base_timestamp}</strong>. The <strong>{forecast24h.model_used}</strong> model ({forecast24h.selection_rationale}) recursively rolls forward each prediction y&#770;(t+k) to predict future step t+k+1. The light blue dashed lines show the expanding 95% confidence interval envelope accounting for recursive uncertainty accumulation over 24 hours.
+                  </div>
+                </div>
+
+                {/* Continuous Trajectory Chart: Past 12h History -> Next 24h Forecast */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500 flex items-center space-x-1.5">
+                      <TrendingUp className="w-4 h-4 text-blue-600" />
+                      <span>Continuous Load Trajectory (Past 12h Ground Truth &rarr; Next 24h Projected Load)</span>
+                    </h3>
+                    <span className="text-xs text-slate-400">Solid: Actual History • Bold Blue: 24h Forecast • Dashed: 95% CI</span>
+                  </div>
+
+                  <div className="h-80 w-full border border-slate-200 rounded-xl p-3 bg-white">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={forecastChartData} margin={{ top: 10, right: 25, left: -10, bottom: 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                        <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#64748b' }} interval="preserveStartEnd" />
+                        <YAxis tick={{ fontSize: 11, fill: '#64748b' }} unit=" kW" domain={['auto', 'auto']} />
+                        <Tooltip
+                          formatter={(value: any, name: any) => [`${Number(value).toFixed(3)} kW`, name]}
+                          labelFormatter={(label, items) => {
+                            const item = items && items[0]?.payload;
+                            return item ? `${item.isHistorical ? 'Historical Ground Truth' : 'Forecast'}: ${item.fullTimestamp}` : String(label);
+                          }}
+                          contentStyle={{ backgroundColor: '#ffffff', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '12px' }}
+                        />
+                        <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                        <Line
+                          type="monotone"
+                          dataKey="HistoricalActual"
+                          stroke="#475569"
+                          strokeWidth={2}
+                          dot={{ r: 2, fill: '#475569' }}
+                          name="Historical Actual (Past 12h)"
+                          connectNulls={false}
+                        />
+                        <Line
+                          type="monotone"
+                          dataKey="Forecast24h"
+                          stroke="#2563eb"
+                          strokeWidth={2.5}
+                          dot={{ r: 3, fill: '#2563eb' }}
+                          name="24h Projected Forecast (kW)"
+                          connectNulls={true}
+                        />
+                        <Line
+                          type="monotone"
+                          dataKey="UpperBound"
+                          stroke="#93c5fd"
+                          strokeDasharray="3 3"
+                          strokeWidth={1.5}
+                          dot={false}
+                          name="Upper 95% Confidence Bound"
+                          connectNulls={true}
+                        />
+                        <Line
+                          type="monotone"
+                          dataKey="LowerBound"
+                          stroke="#93c5fd"
+                          strokeDasharray="3 3"
+                          strokeWidth={1.5}
+                          dot={false}
+                          name="Lower 95% Confidence Bound"
+                          connectNulls={true}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                {/* 24-Hour Breakdown Table */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                      24-Hour Projected Consumption Breakdown
+                    </h3>
+                    <a
+                      href={api.getForecastCsvUrl()}
+                      download="powerpulse_24h_forecast.csv"
+                      className="inline-flex items-center text-xs font-semibold text-blue-600 hover:text-blue-800"
+                    >
+                      <Download className="w-3.5 h-3.5 mr-1" />
+                      Download 24h Forecast CSV
+                    </a>
+                  </div>
+
+                  <div className="overflow-x-auto border border-slate-200 rounded-lg max-h-72 overflow-y-auto">
+                    <table className="min-w-full divide-y divide-slate-200 text-xs">
+                      <thead className="bg-slate-100 text-slate-700 font-semibold sticky top-0">
+                        <tr>
+                          <th className="px-3 py-2 text-center w-16">Horizon</th>
+                          <th className="px-3 py-2 text-left">Projected Timestamp</th>
+                          <th className="px-3 py-2 text-right">Forecast (kW)</th>
+                          <th className="px-3 py-2 text-right">95% Confidence Range</th>
+                          <th className="px-3 py-2 text-center">Projected Profile</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 bg-white font-mono">
+                        {forecast24h.forecast_points.map((pt: ForecastPoint24h) => {
+                          const isPeak = pt.timestamp === forecast24h.peak_hour;
+                          const isMin = pt.timestamp === forecast24h.min_hour;
+                          return (
+                            <tr key={pt.hour_ahead} className={isPeak ? 'bg-rose-50/60 font-semibold' : isMin ? 'bg-emerald-50/60 font-semibold' : 'hover:bg-slate-50'}>
+                              <td className="px-3 py-2 text-center text-slate-500 font-bold">+{pt.hour_ahead}h</td>
+                              <td className="px-3 py-2 text-slate-800">{pt.timestamp}</td>
+                              <td className="px-3 py-2 text-right text-blue-900 font-bold">{pt.forecast_kw.toFixed(3)} kW</td>
+                              <td className="px-3 py-2 text-right text-slate-600">
+                                [{pt.lower_bound_kw.toFixed(3)} – {pt.upper_bound_kw.toFixed(3)}] kW
+                              </td>
+                              <td className="px-3 py-2 text-center font-sans">
+                                {isPeak ? (
+                                  <span className="inline-flex items-center px-2 py-0.5 rounded text-2xs font-bold bg-rose-100 text-rose-800">
+                                    Peak Demand
+                                  </span>
+                                ) : isMin ? (
+                                  <span className="inline-flex items-center px-2 py-0.5 rounded text-2xs font-bold bg-emerald-100 text-emerald-800">
+                                    Base Load
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-400 text-2xs">Normal Load</span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </section>
+            )}
+
             {/* ── F. DOWNLOAD RESULTS ────────────────────────────────────────── */}
             <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-6">
               <div className="pb-4 mb-4 border-b border-slate-100">
                 <h2 className="text-lg font-bold text-slate-900 flex items-center space-x-2">
                   <Download className="w-5 h-5 text-blue-600" />
-                  <span>Download Evaluation Results</span>
+                  <span>Download Evaluation &amp; Forecast Results</span>
                 </h2>
                 <p className="text-sm text-slate-500">
-                  Export test predictions, detected anomalies, and comparative model matrices directly to CSV.
+                  Export test predictions, 24-hour future forecast, detected anomalies, and comparative model matrices directly to CSV.
                 </p>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                <a
+                  href={api.getForecastCsvUrl()}
+                  download="powerpulse_24h_forecast.csv"
+                  className="inline-flex items-center justify-center p-3.5 rounded-lg border border-blue-200 bg-blue-50/50 hover:bg-blue-100 text-blue-900 text-xs font-semibold transition-colors shadow-2xs"
+                >
+                  <Sparkles className="w-4 h-4 mr-2 text-blue-600" />
+                  Download 24h Forecast (CSV)
+                </a>
+
                 <a
                   href={api.getPredictionsCsvUrl()}
                   download="powerpulse_predictions.csv"
