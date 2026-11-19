@@ -582,17 +582,18 @@ class StateManager:
     ) -> Dict[str, Any]:
         """
         Rolls forward 24 hourly recursive predictions using the last 24 hours of available data.
-        Computes 95% expanding confidence bounds.
+        Applies a short-term trend correction from the past 12 hours and computes
+        95% expanding confidence bounds.
         """
         if self.hourly_df is None or len(self.hourly_df) < SEQUENCE_LENGTH:
             return {}
 
-        # Last 24 hours from data
+        # Last 24 hours: conditioning window for the model
         last_24_df = self.hourly_df.iloc[-SEQUENCE_LENGTH:]
         last_timestamp = pd.to_datetime(last_24_df['timestamp'].iloc[-1])
         last_reading_kw = float(last_24_df['Global_active_power'].iloc[-1])
 
-        # Past 12 hours of actual history for visualization context
+        # Past 12 hours: historical context shown in the chart
         history_12_df = self.hourly_df.iloc[-12:]
         history_context = [
             {
@@ -603,7 +604,14 @@ class StateManager:
             for _, row in history_12_df.iterrows()
         ]
 
-        # Scaled initial window
+        # Compute recent short-term trend (average hourly delta over last 12 hours)
+        recent_vals = history_12_df['Global_active_power'].values.astype(float)
+        recent_changes = [recent_vals[i] - recent_vals[i - 1] for i in range(1, len(recent_vals))]
+        avg_trend = float(np.mean(recent_changes)) if recent_changes else 0.0
+        # Dampen trend so it doesn't explode over 24 hours
+        avg_trend = np.clip(avg_trend, -0.05, 0.05)
+
+        # Build scaled initial window for the model
         raw_window = last_24_df['Global_active_power'].values.reshape(-1, 1)
         scaled_window = self.scaler.transform(raw_window)
         current_window = scaled_window.reshape(1, SEQUENCE_LENGTH, 1).copy()
@@ -612,15 +620,18 @@ class StateManager:
         cumulative_kwh = 0.0
 
         for h in range(1, 25):
-            # Predict next step
+            # 1-step ahead prediction from the model
             pred_scaled = float(model.predict(current_window, verbose=0)[0, 0])
             pred_kw = float(self.scaler.inverse_transform([[pred_scaled]])[0, 0])
             pred_kw = max(0.0, pred_kw)
 
-            # 95% Confidence Interval (expanding uncertainty margin)
+            # Apply dampened trend correction
+            forecast_kw = max(0.0, pred_kw + avg_trend * h)
+
+            # Expanding 95% confidence interval (uncertainty grows with horizon)
             margin = 1.96 * test_rmse * (1.0 + 0.05 * np.sqrt(h))
-            upper_bound = round(pred_kw + margin, 3)
-            lower_bound = round(max(0.0, pred_kw - margin), 3)
+            upper_bound = round(forecast_kw + margin, 3)
+            lower_bound = round(max(0.0, forecast_kw - margin), 3)
 
             proj_time = last_timestamp + pd.Timedelta(hours=h)
             timestamp_str = proj_time.strftime("%Y-%m-%d %H:%M:%S")
@@ -628,15 +639,15 @@ class StateManager:
             forecast_points.append({
                 "hour_ahead": h,
                 "timestamp": timestamp_str,
-                "forecast_kw": round(pred_kw, 3),
+                "forecast_kw": round(forecast_kw, 3),
                 "lower_bound_kw": lower_bound,
                 "upper_bound_kw": upper_bound,
                 "confidence_margin_kw": round(margin, 3)
             })
 
-            cumulative_kwh += pred_kw
+            cumulative_kwh += forecast_kw
 
-            # Slide window forward
+            # Slide window forward using the raw model prediction (not trend-adjusted)
             new_step = np.array([[[pred_scaled]]])
             current_window = np.concatenate([current_window[:, 1:, :], new_step], axis=1)
 
@@ -644,7 +655,10 @@ class StateManager:
         max_idx = int(np.argmax(kw_values))
         min_idx = int(np.argmin(kw_values))
 
-        selection_rationale = best_reason if (is_best and best_reason) else f"Trained {model_name} recurrent neural network"
+        selection_rationale = (
+            best_reason if (is_best and best_reason)
+            else f"Trained {model_name} recurrent neural network"
+        )
 
         forecast_result = {
             "model_used": model_name,
